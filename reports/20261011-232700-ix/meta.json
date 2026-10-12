@@ -1,0 +1,56 @@
+{
+  "time": "2026-10-11T23:27:00.024681",
+  "photo_size": [
+    720,
+    481
+  ],
+  "corners": [
+    [
+      152.10009765625,
+      21.2001953125
+    ],
+    [
+      611.25,
+      31.14990234375
+    ],
+    [
+      680.5498046875,
+      427.60009765625
+    ],
+    [
+      74.14990234375,
+      407.25
+    ]
+  ],
+  "rect_cell": 80,
+  "recognizer": "local",
+  "recognized_rows": [
+    "cnkpcabnb",
+    ".........",
+    ".c.....c.",
+    "p.p.p.p.p",
+    ".........",
+    ".........",
+    "P.P.P.P.P",
+    ".C.....C.",
+    ".........",
+    "CNCPKPCNC"
+  ],
+  "corrected_rows": [
+    "rnbakabnr",
+    ".........",
+    ".c.....c.",
+    "p.p.p.p.p",
+    ".........",
+    ".........",
+    "P.P.P.P.P",
+    ".C.....C.",
+    ".........",
+    "RNBAKABNR"
+  ],
+  "corrected_fen": "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1",
+  "flipped": false,
+  "diff_cells": 11,
+  "note": "",
+  "platform": "android"
+}
