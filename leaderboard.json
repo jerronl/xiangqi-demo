@@ -1,5 +1,12 @@
 {
- "updated": "2026-10-14T00:47:48+00:00",
+ "updated": "2026-10-14T02:26:15+00:00",
  "per_day": 5,
- "players": []
+ "players": [
+  {
+   "id": "jerronl",
+   "name": "jerronl",
+   "points": 7,
+   "last": "2026-10-12"
+  }
+ ]
 }
