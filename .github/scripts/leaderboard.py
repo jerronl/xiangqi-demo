@@ -161,18 +161,20 @@ def check(r):
         return "没有 GitHub 作者"
     if r.author.endswith("[bot]"):
         return "机器人的 issue"
-    if r.photo is None:
-        return r.photo_error or (PENDING if r.gist else "没有照片")
-    if r.kind == "corners":
-        return None if r.corner_fixed else "找角结果未纠正"
+    # 先看内容，最后才看照片：内容不合格的上报不用等照片，直接告诉用户原因
     if r.kind == "other":
         return "不是识别问题上报"
-    if r.recognized is None:
+    if r.kind == "corners":
+        if not r.corner_fixed:
+            return "找角结果未纠正"
+    elif r.recognized is None:
         return "没有识别结果"
-    if r.corrected is None or not legal(r.corrected, r.kind):
+    elif r.corrected is None or not legal(r.corrected, r.kind):
         return "纠正后的局面不合法"
-    if r.recognized == r.corrected:
+    elif r.recognized == r.corrected:
         return "识别结果与纠正后相同"
+    if r.photo is None:
+        return r.photo_error or (PENDING if r.gist else "没有照片")
     return None
 
 
