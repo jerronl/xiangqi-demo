@@ -28,7 +28,6 @@ NAME_MAX = 24
 INVALID, SCORED = "invalid", "scored"
 MARK = "<!-- leaderboard -->"
 
-ACCOUNT = re.compile(r"^adfree-account:\s*([0-9a-f]{64})\s*$", re.M)
 NAME = re.compile(r"^leaderboard-name:[ \t]*(.*)$", re.M)
 # 照片只认本仓库 reports/ 下的文件和 GitHub 附件；markdown 图片或网页编辑器插入的 <img src="...">
 _PHOTO_URL = (r"https://github\.com/" + re.escape(REPO) + r"/blob/main/reports/[\w.-]+/photo\.[a-z]+\?raw=true"
@@ -39,6 +38,13 @@ DOWNLOAD_SECONDS = 60
 FENLINE = re.compile(r"^- (识别|纠正后) FEN：`([^`]*)`", re.M)
 TABLE = re.compile(r"(识别结果（屏幕方向，大写红方）：|纠正后：)\n(（无）|```\n(.*?)\n```)", re.S)
 REC_TABLE, COR_TABLE = "识别结果（屏幕方向，大写红方）：", "纠正后："
+
+# App 附在正文末尾的机读数据（网页上不显示）；有它就不靠中文字样解析
+DATA = re.compile(r"<!-- qiwang-report (\{[^\n]{0,8000}?\}) -->")   # 一行、限长，坏数据拖不慢
+GIST_URL = re.compile(r"^https://gist\.github\.com/([\w-]+)/([0-9a-f]+)$")
+GIST_LINE = re.compile(r"^- (?:照片|Photo)[：:]\s*(https://gist\.github\.com/[\w-]+/[0-9a-f]+)\s*$", re.M)
+KINDS = {"xiangqi", "chess", "corners"}
+MAX_META = 64 << 10
 
 XQ_CAPS = {"k": 1, "a": 2, "b": 2, "n": 2, "r": 2, "c": 2, "p": 5}
 CHESS_CAPS = {"k": 1, "q": 9, "r": 10, "b": 10, "n": 10, "p": 8}
@@ -57,6 +63,10 @@ class Report:
     corner_fixed: bool = False
     labels: set = field(default_factory=set)
     author: str | None = None    # issue 的 GitHub 作者
+    gist: str | None = None      # 照片所在 gist（App 登录后上报），机器人搬进仓库
+    lang: str = "zh"             # 留言语言
+    state: str = "open"
+    photo_error: str | None = None
 
 
 def fen_rows(fen):
@@ -76,16 +86,39 @@ def clean_name(s):
     return s[:NAME_MAX] or None
 
 
+def _rows(v):
+    return v if isinstance(v, list) and all(isinstance(x, str) for x in v) and v else None
+
+
 def parse_issue(i):
     body = (i.get("body") or "").replace("\r\n", "\n")   # 网页上提交的正文是 CRLF
     title = i.get("title") or ""
-    # 账号和显示名取最后一处：App 把它们写在正文末尾，说明文字里的同名行不算
-    acc, name = ACCOUNT.findall(body), NAME.findall(body)
-    photo = PHOTO.search(body)
-    r = Report(number=i["number"], created=i["created_at"], account=acc[-1] if acc else None,
+    author = (i.get("user") or {}).get("login")
+    name, photo = NAME.findall(body), PHOTO.search(body)
+    r = Report(number=i["number"], created=i["created_at"], account=author.lower() if author else None,
                name=clean_name(name[-1]) if name else None, kind="other",
                photo=photo and (photo.group(1) or photo.group(2)),
-               labels={x["name"] for x in i.get("labels", [])}, author=(i.get("user") or {}).get("login"))
+               labels={x["name"] for x in i.get("labels", [])}, author=author, state=i.get("state") or "open")
+    data = None
+    for m in DATA.findall(body):
+        try:
+            d = json.loads(m)
+        except Exception:      # 包括极深嵌套引起的 RecursionError：坏数据块直接忽略
+            continue
+        if isinstance(d, dict) and d.get("kind") in KINDS:
+            data = d
+    if data is not None:
+        r.kind = data["kind"]
+        r.lang = "en" if data.get("lang") == "en" else "zh"
+        if isinstance(data.get("name"), str):
+            r.name = clean_name(data["name"])
+        r.recognized, r.corrected = _rows(data.get("recognized")), _rows(data.get("corrected"))
+        r.corner_fixed = data.get("corner_fixed") is True
+        g = data.get("photo_gist")
+        r.gist = g if isinstance(g, str) and GIST_URL.match(g) else None
+        return r
+    g = GIST_LINE.search(body)
+    r.gist = g and g.group(1)
     if title.startswith("找角问题"):
         r.kind = "corners"
         r.corner_fixed = "已手动纠正" in title or "没找到棋盘" in title
@@ -125,9 +158,11 @@ def check(r):
     if INVALID in r.labels:
         return "已被标记为无效"
     if r.account is None:
-        return "没有绑定 Google 账号"
+        return "没有 GitHub 作者"
+    if r.author.endswith("[bot]"):
+        return "机器人的 issue"
     if r.photo is None:
-        return "没有照片"
+        return r.photo_error or (PENDING if r.gist else "没有照片")
     if r.kind == "corners":
         return None if r.corner_fixed else "找角结果未纠正"
     if r.kind == "other":
@@ -173,12 +208,10 @@ def score(reports, photo_hash, now, claims=None):
             continue
         seen.add(h)
         per_day[(r.account, r.created[:10])] += 1
-        p = players.setdefault(r.account, {"id": r.account, "name": r.account[:8], "points": 0, "times": [],
-                                           "author": r.author})
+        p = players.setdefault(r.account, {"id": r.account, "name": r.author or r.account, "points": 0, "times": []})
         p["points"] += 1
         p["times"].append(r.created)
-        # 账号哈希是公开的，别人可以冒用它上报；显示名只认该账号第一个计分上报的 GitHub 作者
-        if r.name and r.author == p["author"]:
+        if r.name:      # 账号就是 issue 作者，显示名只能本人改
             p["name"] = r.name
     adfree = {}
     for acc, p in players.items():
@@ -196,14 +229,115 @@ def score(reports, photo_hash, now, claims=None):
     return Result(board, adfree, verdict, claimed)
 
 
-def comment_for(verdict, points, until):
+REASON_EN = {
+    "已被标记为无效": "marked invalid", "没有 GitHub 作者": "no GitHub author", "机器人的 issue": "issue by a bot",
+    "没有照片": "no photo", "照片还没有取到": "photo not fetched yet", "照片不属于上报者": "the photo gist is not yours",
+    "gist 不存在": "the photo gist does not exist", "gist 里没有照片": "no photo in the gist",
+    "照片格式不对": "the photo is not a JPEG/PNG", "照片数据损坏": "the photo data is corrupted",
+    "照片太大": "the photo is too large", "照片无法下载": "the photo could not be downloaded",
+    "找角结果未纠正": "the corners were not corrected", "不是识别问题上报": "not a recognition report",
+    "没有识别结果": "no recognition result", "纠正后的局面不合法": "the corrected position is not legal",
+    "识别结果与纠正后相同": "the corrected position equals the recognized one",
+    "这张照片已经上报过": "this photo was already reported",
+}
+
+
+PENDING = "照片还没有取到"
+
+
+def comment_for(verdict, points, until, lang="zh"):
+    """issue 留言；照片还在等待搬运时不留言（返回 None）"""
+    if verdict == PENDING:
+        return None
+    en = lang == "en"
     if verdict is None:
+        if en:
+            s = f"{MARK}\nThanks for the report! +1 point, {points} in total (every {PER_DAY} points = 1 ad-free day)."
+            if until:
+                s += f" Ad-free until {until[:16].replace('T', ' ')} UTC."
+            return s + "\n\nLeaderboard: in the app under About → Leaderboard, or leaderboard.json in this repository."
         s = f"{MARK}\n感谢上报！+1 分，当前 {points} 分（每 {PER_DAY} 分自动换 1 天免广告）。"
         if until:
             s += f"免广告到 {until[:16].replace('T', ' ')} UTC。"
-        return (s + "\n\n积分榜：App“关于 → 积分榜”，或仓库根目录 leaderboard.json。\n"
-                f"Thanks! +1 point ({points} in total). Every {PER_DAY} points = 1 ad-free day.")
-    return f"{MARK}\n没有计分：{verdict}。\nNot scored (reason above)."
+        return s + "\n\n积分榜：App“关于 → 积分榜”，或仓库根目录 leaderboard.json。"
+    if en:
+        why = (f"daily limit of {DAILY_CAP} points reached" if verdict.startswith("今天已达上限")
+               else REASON_EN.get(verdict, verdict))
+        return f"{MARK}\nNot scored: {why}."
+    return f"{MARK}\n没有计分：{verdict}。"
+
+
+def _b64(text):
+    try:
+        return base64.b64decode("".join(text.split()), validate=True)
+    except (ValueError, TypeError):
+        return None
+
+
+def _image_ext(data):
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    return None
+
+
+MISSING = "missing"   # gist 确实不存在（404）；None 表示暂时取不到（限流、网络），下次再试
+
+
+def gist_files(g, author, fetch):
+    """从 gist 取出照片等文件：({文件名: 字节}, None)、(None, 原因) 或暂时取不到时 (None, None)。
+    fetch(raw_url) → 文本或 None"""
+    if g is None:
+        return None, None
+    if g == MISSING:
+        return None, "gist 不存在"
+    if ((g.get("owner") or {}).get("login") or "").lower() != (author or "").lower():
+        return None, "照片不属于上报者"
+    files = g.get("files") or {}
+
+    def text(name):
+        f = files.get(name)
+        if not f:
+            return None
+        t = fetch(f.get("raw_url", "")) if f.get("truncated") else f.get("content")
+        return t if isinstance(t, str) else None
+
+    if "photo.jpg.b64" not in files:
+        return None, "gist 里没有照片"
+    t = text("photo.jpg.b64")
+    if t is None:
+        return None, None
+    if len(t) > MAX_PHOTO * 4 // 3 + 1024:
+        return None, "照片太大"
+    data = _b64(t)
+    if data is None:
+        return None, "照片数据损坏"
+    ext = _image_ext(data)
+    if ext is None:
+        return None, "照片格式不对"
+    out = {f"photo.{ext}": data}
+    t = text("rectified.png.b64")
+    rect = _b64(t) if t and len(t) <= MAX_PHOTO else None
+    if rect and _image_ext(rect) == "png":
+        out["rectified.png"] = rect
+    t = text("meta.json")
+    if t and len(t) <= MAX_META:
+        out["meta.json"] = t.encode()
+    return out, None
+
+
+def rewrite_body(body, gist_url, photo_url, lang):
+    """把照片插进正文：可见的 gist 行换成图片，并留一行原 gist 链接"""
+    body = body.replace("\r\n", "\n")
+    label = "Original gist" if lang == "en" else "原始 gist"
+    img = f"![photo]({photo_url})\n- {label}: {gist_url}"
+    m = GIST_LINE.search(body)
+    if m:
+        return body[:m.start()] + img + body[m.end():]
+    m = DATA.search(body)
+    at = m.start() if m else len(body)
+    return body[:at] + "\n" + img + "\n" + body[at:]
 
 
 class GitHub:
@@ -247,6 +381,37 @@ class GitHub:
             body["sha"] = sha
         self.req("PUT", f"/contents/{name}", body)
 
+    def put_bytes(self, path, data, msg):
+        """上传文件；已经存在（上次传了一半）就不再传"""
+        try:
+            self.req("PUT", f"/contents/{path}", {"message": msg, "content": base64.b64encode(data).decode()})
+        except urllib.error.HTTPError as e:
+            if e.code != 422:
+                raise
+
+    @staticmethod
+    def public_bytes(url, limit=MAX_PHOTO * 4 // 3 + 4096):
+        """不带 token 下载（公开资源）；超过 limit、超时或出错返回 None"""
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "qiwang-leaderboard"}),
+                                        timeout=20) as resp:
+                out, deadline = bytearray(), time.monotonic() + DOWNLOAD_SECONDS
+                while chunk := resp.read(1 << 16):
+                    out += chunk
+                    if len(out) > limit or time.monotonic() > deadline:
+                        return None
+                return bytes(out)
+        except Exception:
+            return None
+
+    def gist(self, gid):
+        """gist 的 JSON；不存在返回 MISSING，暂时取不到（限流、网络）返回 None"""
+        try:
+            g, _ = self.req("GET", f"https://api.github.com/gists/{gid}")
+        except Exception:
+            return None
+        return MISSING if g is None else g
+
     def photo_sha(self, url):
         """下载照片算哈希（不带 token：仓库是公开的）；失败返回 None"""
         try:
@@ -282,6 +447,58 @@ def token():
     return subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=True).stdout.strip()
 
 
+def should_move(r, moved_today):
+    """只搬会计分的上报：issue 开着、没作废、作者当天搬运没超上限、除了照片以外都合格"""
+    if r.state != "open" or moved_today >= DAILY_CAP:
+        return False
+    return check(Report(**{**r.__dict__, "photo": "pending"})) is None
+
+
+def fetch_gists(gh, issues, cache, now, repo, write=True):
+    """把 App 上报放在 gist 里的照片搬进仓库 reports/<issue 号>/，改写 issue 正文插入照片。
+    返回 {issue 号: 失败原因}（暂时取不到的不算失败）"""
+    errors, moved = {}, Counter()
+    failed = cache.setdefault("gist_errors", {})
+    for i in issues:
+        try:
+            r = parse_issue(i)
+            if not r.gist or r.photo or not r.author:
+                continue
+            key = f"{r.number}:{r.gist}"
+            if key in failed:                  # 永久错误（不存在、不是作者的、格式不对）不再重试
+                errors[r.number] = failed[key]
+                continue
+            day = (r.account, now.strftime("%Y-%m-%d"))
+            if not should_move(r, moved[day]):
+                continue
+            files, err = gist_files(gh.gist(GIST_URL.match(r.gist).group(2)), r.author,
+                                    lambda u: (gh.public_bytes(u) or b"").decode("ascii", "replace") or None)
+            if err:
+                errors[r.number] = failed[key] = err
+                continue
+            if files is None:
+                continue                       # 暂时取不到，下次再试，不留言
+            folder = f"reports/{r.number}"
+            photo = next(k for k in files if k.startswith("photo."))
+            url = f"https://github.com/{repo}/blob/main/{folder}/{photo}?raw=true"
+            new_body = rewrite_body(i.get("body") or "", r.gist, url, r.lang)
+            if len(new_body) > 65000:
+                errors[r.number] = failed[key] = "正文太长"
+                continue
+            print(f"#{r.number}: gist → {folder}")
+            moved[day] += 1
+            if not write:
+                continue
+            for name, data in files.items():
+                gh.put_bytes(f"{folder}/{name}", data, f"report #{r.number}: {name}")
+            gh.req("PATCH", f"/issues/{r.number}", {"body": new_body})
+            i["body"] = new_body
+            cache["photos"][f"{r.number}:{url}"] = hashlib.sha256(files[photo]).hexdigest()
+        except Exception as e:                 # 一个 issue 出错不影响其他
+            print(f"#{i.get('number')}: gist error {e!r}")
+    return errors
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", default=REPO)
@@ -289,10 +506,15 @@ def main():
     ap.add_argument("--seed-cache", action="store_true", help="只记录判定，不留言不打标签")
     a = ap.parse_args()
     gh = GitHub(a.repo, token())
-    reports = [parse_issue(i) for i in gh.issues()]
+    issues = gh.issues()
     cache, cache_sha = gh.get_file(FILES["cache"])
     old_cache = json.loads(json.dumps(cache)) if cache else None
     cache = cache or {"photos": {}, "commented": {}}
+    now = dt.datetime.now(dt.timezone.utc)
+    gist_error = fetch_gists(gh, issues, cache, now, a.repo, write=not (a.dry_run or a.seed_cache))
+    reports = [parse_issue(i) for i in issues]
+    for r in reports:
+        r.photo_error = gist_error.get(r.number)
     hashes = {}
     for r in reports:
         if check(r) is not None:
@@ -303,7 +525,6 @@ def main():
             if h:
                 cache["photos"][key] = h
         hashes[r.number] = cache["photos"].get(key)
-    now = dt.datetime.now(dt.timezone.utc)
     res = score(reports, hashes, now, cache.get("claims"))
     cache["claims"] = res.claims
     points = {p["id"]: p["points"] for p in res.board["players"]}
@@ -314,17 +535,22 @@ def main():
                 continue
             v = res.verdict[r.number]
             state = "scored" if v is None else v
-            if cache["commented"].get(str(r.number)) == state:
-                continue
+            msg = comment_for(v, points.get(r.account, 0), res.adfree.get(r.account), r.lang)
+            if msg is None or cache["commented"].get(str(r.number)) == state:
+                continue                       # 照片还在等待搬运：先不留言
             print(f"#{r.number}: {state}")
-            if not quiet:
-                gh.req("POST", f"/issues/{r.number}/comments",
-                       {"body": comment_for(v, points.get(r.account, 0), res.adfree.get(r.account))})
-                if v is None:
-                    gh.req("POST", f"/issues/{r.number}/labels", {"labels": [SCORED]})
-                elif SCORED in r.labels:
-                    gh.req("DELETE", f"/issues/{r.number}/labels/{SCORED}")
-            cache["commented"][str(r.number)] = state
+            try:
+                if not quiet:
+                    gh.req("POST", f"/issues/{r.number}/comments", {"body": msg})
+                    if v is None:
+                        gh.req("POST", f"/issues/{r.number}/labels", {"labels": [SCORED]})
+                    elif SCORED in r.labels:
+                        gh.req("DELETE", f"/issues/{r.number}/labels/{SCORED}")
+                    if v is not None and v.startswith("今天已达上限") and r.state == "open":   # 刷屏的直接关掉
+                        gh.req("PATCH", f"/issues/{r.number}", {"state": "closed", "state_reason": "not_planned"})
+                cache["commented"][str(r.number)] = state
+            except Exception as e:             # 一个 issue 出错不影响其他，下次再试
+                print(f"#{r.number}: comment error {e!r}")
         print(json.dumps(res.board, ensure_ascii=False, indent=1))
         if a.dry_run:
             return
